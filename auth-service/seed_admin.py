@@ -60,4 +60,3 @@ if __name__ == "__main__":
         print("WARNING: using default password 'changeme!' — change it after first login.")
 
     asyncio.run(seed(args.username, args.password))
-    # --- Gemini Key AQ.Ab8RN6KCq_WNJR148LeBKx9IR9nWVma9h7ksdvep1wnVKmlERg
