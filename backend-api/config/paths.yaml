@@ -1,0 +1,10 @@
+vendor_standard:
+  - pm_scripts
+  - source_files
+  - parameter_files
+
+vendor_premium:
+  - pm_scripts
+  - source_files
+  - target_files
+  - parameter_files

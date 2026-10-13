@@ -1,0 +1,10 @@
+daily_load:
+  script: ./scripts/
+  roles:
+    - vendor_standard
+    - vendor_premium
+
+parameter_reload:
+  script: ./scripts/
+  roles:
+    - vendor_premium

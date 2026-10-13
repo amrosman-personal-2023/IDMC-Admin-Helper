@@ -1,0 +1,123 @@
+version: "3.9"
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  internal:           # auth-service ↔ backend-api (never exposed to host)
+    driver: bridge
+    internal: true
+  frontend:           # nginx ↔ backend services
+    driver: bridge
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  postgres-data:
+  idmc-staging:       # IDMC Secure Agent staging directories
+  idmc-scripts:       # pre-approved script files
+  llm-settings:       # encrypted LLM settings file
+
+# ═══════════════════════════════════════════════════════════════════════════════
+services:
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    networks: [internal]
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-idmc_portal}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB:-idmc_portal}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-idmc_portal}"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+
+  # ── Auth Service (port 8001, internal only) ───────────────────────────────────
+  auth-service:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    image: idmc/auth-service:${TAG:-latest}
+    restart: unless-stopped
+    networks: [internal, frontend]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_URL:                   postgresql+asyncpg://${POSTGRES_USER:-idmc_portal}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-idmc_portal}
+      JWT_SIGNING_KEY:          ${JWT_SIGNING_KEY}
+      JWT_PUBLIC_KEY:           ${JWT_PUBLIC_KEY}
+      ADMIN_API_KEY:            ${ADMIN_API_KEY}
+      ADMIN_SESSION_SECRET:     ${ADMIN_SESSION_SECRET}
+      ENROLLMENT_LINK_BASE_URL: ${PORTAL_BASE_URL:-http://localhost}/enroll
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || exit 1"]
+      interval: 15s
+      timeout:  5s
+      retries:  5
+    # Auth service is NOT exposed to the host; only nginx and backend-api reach it
+    expose: ["8001"]
+
+  # ── Backend API (port 8002, internal only) ────────────────────────────────────
+  backend-api:
+    build:
+      context: ./backend-api
+      dockerfile: Dockerfile
+    image: idmc/backend-api:${TAG:-latest}
+    restart: unless-stopped
+    networks: [internal, frontend]
+    depends_on:
+      auth-service:
+        condition: service_healthy
+    environment:
+      AUTH_SERVICE_URL:      http://auth-service:8001
+      IDMC_STAGING_ROOT:     /opt/idmc/staging
+      ALLOWED_PATHS_CONFIG:  /etc/idmc-portal/paths.yaml
+      OPERATIONS_CONFIG:     /etc/idmc-portal/operations.yaml
+      LOG_PATHS_CONFIG:      /etc/idmc-portal/log_paths.yaml
+      UPLOAD_TOKEN_SECRET:   ${UPLOAD_TOKEN_SECRET}
+      ADMIN_SESSION_SECRET:  ${ADMIN_SESSION_SECRET}
+      LLM_SETTINGS_PATH:     /etc/idmc-portal/llm-settings.enc
+      # Seed LLM settings on first boot (overridden by admin console)
+      LLM_PROVIDER:          ${LLM_PROVIDER:-anthropic}
+      LLM_API_KEY:           ${LLM_API_KEY:-}
+      LLM_MODEL:             ${LLM_MODEL:-claude-opus-4-8}
+      LLM_MAX_CONTEXT_TOKENS: ${LLM_MAX_CONTEXT_TOKENS:-80000}
+    volumes:
+      - idmc-staging:/opt/idmc/staging
+      - idmc-scripts:/opt/idmc/scripts
+      - llm-settings:/etc/idmc-portal
+      - ./backend-api/config/paths.yaml:/etc/idmc-portal/paths.yaml:ro
+      - ./backend-api/config/operations.yaml:/etc/idmc-portal/operations.yaml:ro
+      - ./backend-api/config/log_paths.yaml:/etc/idmc-portal/log_paths.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8002/health || exit 1"]
+      interval: 15s
+      timeout:  5s
+      retries:  5
+    expose: ["8002"]
+
+  # ── Portal SPA + nginx (port 80 public) ───────────────────────────────────────
+  portal:
+    build:
+      context: ./portal-spa
+      dockerfile: Dockerfile
+    image: idmc/portal:${TAG:-latest}
+    restart: unless-stopped
+    networks: [frontend]
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      backend-api:
+        condition: service_healthy
+    ports:
+      - "80:80"       # HTTP  — redirect to HTTPS in production
+      # - "443:443"   # Uncomment when TLS cert is mounted
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/ || exit 1"]
+      interval: 15s
+      timeout:  5s
+      retries:  3

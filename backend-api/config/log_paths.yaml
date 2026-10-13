@@ -1,0 +1,26 @@
+# Log Analyser browse roots.
+# Completely independent of paths.yaml (vendor upload directories).
+# These paths are accessible to admin users only — vendors never see them.
+#
+# Add any directory the Log Analyser should be able to browse.
+# Each entry requires:
+#   name  — unique identifier (alphanumeric, used internally)
+#   label — display name shown in the FileTree and sent to the LLM as service context
+#   path  — absolute path on the host / inside the container
+
+roots:
+  - name: staging
+    label: "IDMC Staging"
+    path: /opt/idmc/staging
+
+  - name: agent_logs
+    label: "IDMC Secure Agent Logs"
+    path: /opt/informatica/logs
+
+  - name: auth_logs
+    label: "Auth Service Logs"
+    path: /var/log/idmc/auth
+
+  - name: api_logs
+    label: "Backend API Logs"
+    path: /var/log/idmc/api

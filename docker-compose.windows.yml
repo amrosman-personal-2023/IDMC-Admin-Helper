@@ -1,0 +1,38 @@
+version: "3.9"
+
+# Windows override for docker-compose.yml.
+#
+# Usage:
+#   $env:TAG='latest'; docker compose -f docker-compose.yml -f docker-compose.windows.yml --env-file .env up -d
+#
+# This file adjusts volume paths and resource limits for Docker Desktop on Windows.
+# Windows uses named volumes only (no host-path bind mounts for IDMC staging dirs).
+# Mount host IDMC directories via Docker Desktop → Settings → Resources → File Sharing.
+
+volumes:
+  idmc-staging:
+    driver: local
+  idmc-scripts:
+    driver: local
+  llm-settings:
+    driver: local
+
+services:
+  backend-api:
+    # On Windows, replace bind mounts with named volumes.
+    # To use actual host paths, add them to Docker Desktop's shared folders list
+    # and change these to: - //c/idmc/staging:/opt/idmc/staging
+    volumes:
+      - idmc-staging:/opt/idmc/staging
+      - idmc-scripts:/opt/idmc/scripts
+      - llm-settings:/etc/idmc-portal
+      - ./backend-api/config/paths.yaml:/etc/idmc-portal/paths.yaml:ro
+      - ./backend-api/config/operations.yaml:/etc/idmc-portal/operations.yaml:ro
+
+  # On Windows Docker Desktop the internal network restriction behaves differently.
+  # Explicitly block external access by not publishing ports for internal services.
+  auth-service:
+    ports: []           # no host port mapping — access only through portal/nginx
+
+  postgres:
+    ports: []           # no external access — internal network only

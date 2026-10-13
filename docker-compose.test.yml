@@ -1,0 +1,43 @@
+version: "3.9"
+
+# Extends docker-compose.yml for CI / integration testing.
+# Uses SQLite instead of Postgres; no persistent volumes.
+
+networks:
+  internal:
+    driver: bridge
+    internal: true
+  frontend:
+    driver: bridge
+
+services:
+  auth-service:
+    extends:
+      file: docker-compose.yml
+      service: auth-service
+    networks: [internal, frontend]
+    environment:
+      DB_URL: sqlite+aiosqlite:///./test.db
+    depends_on: {}        # no postgres in test mode
+
+  backend-api:
+    extends:
+      file: docker-compose.yml
+      service: backend-api
+    networks: [internal, frontend]
+    depends_on:
+      auth-service:
+        condition: service_healthy
+    volumes:
+      - /tmp/idmc-staging:/opt/idmc/staging
+      - /tmp/idmc-scripts:/opt/idmc/scripts
+      - /tmp/idmc-config:/etc/idmc-portal
+      - ./backend-api/config/paths.yaml:/etc/idmc-portal/paths.yaml:ro
+      - ./backend-api/config/operations.yaml:/etc/idmc-portal/operations.yaml:ro
+
+  portal:
+    extends:
+      file: docker-compose.yml
+      service: portal
+    networks: [frontend]
+    ports: ["8080:80"]

@@ -1,0 +1,277 @@
+Using the IDMC Auth Service
+
+  1. Prerequisites
+
+  cd "auth-service"
+  python3 -m venv .venv && source .venv/bin/activate
+  pip install -r requirements.txt
+
+  ---
+  2. Generate secrets
+
+  # RS256 key pair
+  openssl genrsa -out jwt_private.pem 4096
+  openssl rsa -in jwt_private.pem -pubout -out jwt_public.pem
+
+  # Random hex secrets
+  openssl rand -hex 32   # → ADMIN_API_KEY
+  openssl rand -hex 32   # → ADMIN_SESSION_SECRET
+
+  ---
+  3. Set environment variables
+
+  export JWT_SIGNING_KEY="$(cat jwt_private.pem)"
+  export JWT_PUBLIC_KEY="$(cat jwt_public.pem)"
+  export ADMIN_API_KEY="d0d356805c1517fa23eef4cf78f77a5aa359b77793329e9a9032e16513110d6f"           # "<32-byte hex from above>"
+  export ADMIN_SESSION_SECRET="fcda3acf0c782cb08aa0463d936d6b8aa413bd1707dc6d110aea4be4789007a2"    #"<32-byte hex from above>"
+  export DB_URL="sqlite+aiosqlite:///./dev.db"          # dev
+  # export DB_URL="postgresql+asyncpg://user:pw@host/db" # prod
+  export ENROLLMENT_LINK_BASE_URL="https://192.168.1.1/enroll"        #"https://your-host/enroll"
+
+  The service exits immediately on startup if any of the first four are absent.
+
+  ---
+  4. Run the service
+
+  uvicorn app.main:app --host 0.0.0.0 --port 8001
+  # http://localhost:8001/health → {"status": "ok"}
+
+  The database tables are created automatically on first start.
+
+  ---
+  5. First-time setup: create an admin account
+  
+  The service has no admin bootstrap endpoint — seed the first admin directly in the DB or add a one-time seed script:
+
+  # seed_admin.py  (run once, then delete)
+  import asyncio, bcrypt
+  from app.database import AsyncSessionLocal, engine
+  from app.models import Base, Admin
+  from datetime import datetime, timezone
+
+  async def main():
+      async with engine.begin() as conn:
+          await conn.run_sync(Base.metadata.create_all)
+      async with AsyncSessionLocal() as db:
+          db.add(Admin(
+              username="sysadmin",
+              bcrypt_password_hash=bcrypt.hashpw(b"changeme!", bcrypt.gensalt(12)).decode(),
+              created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+              active=True,
+          ))
+          await db.commit()
+
+  asyncio.run(main())
+
+  python seed_admin.py
+
+  ---
+  6. Typical workflow
+  
+  Admin logs in
+
+  curl -c cookies.txt -X POST http://localhost:8001/admin/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"username": "sysadmin", "password": "changeme!"}'
+  # Response sets HttpOnly cookie "admin_session"
+  # {"logged_in": true, "expires_at": "..."}
+
+  Admin creates a vendor
+
+  curl -b cookies.txt -X POST http://localhost:8001/admin/vendors \
+    -H "Content-Type: application/json" \
+    -d '{"username": "acme_vendor", "password": "vendorpass!", "role": "vendor_standard"}'
+  # {"vendor_id": 1, "enrollment_link": "https://your-host/enroll?token=...", ...}
+  Send the enrollment_link to the vendor for mobile app setup.
+  
+  Vendor enrolls device (called by the mobile app)
+
+  curl -X POST http://localhost:8001/enroll \
+    -H "Content-Type: application/json" \
+    -d '{"enrollment_token": "<token from link>", "device_uuid": "<app-generated UUID>"}'
+  # {"totp_seed": "BASE32SEED...", "enrolled": true}
+  # The app stores the seed in hardware keychain — it is never returned again
+
+  Vendor logs in
+
+  curl -X POST http://localhost:8001/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{
+      "username": "acme_vendor",
+      "password": "vendorpass!",
+      "totp_code": "123456",
+      "device_uuid": "<same UUID used at enrollment>"
+    }'
+  # {"access_token": "<JWT>", "token_type": "bearer", "expires_at": "..."}
+  The backend API uses this token as Authorization: Bearer <JWT>.
+  
+  Other services validate vendor tokens (internal)
+
+  curl -X POST http://localhost:8001/auth/validate \
+    -H "Content-Type: application/json" \
+    -d '{"jwt_token": "<JWT>"}'
+  # {"valid": true, "vendor_id": 1, "role": "vendor_standard", "expires_at": "..."}
+
+  ---
+  7. Admin management endpoints
+  
+  All require the admin_session cookie from the login step.
+
+  ┌──────────────────────────┬──────────────────────────────────────────────────────────────────────────────────┐
+  │          Action          │                                     Request                                      │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ List all devices         │ GET /admin/devices                                                               │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Filter by vendor         │ GET /admin/devices?vendor_id=1                                                   │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Revoke a device          │ POST /admin/devices/revoke {"device_uuid":"...", "vendor_id":1}                  │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Re-issue enrollment link │ POST /admin/enrollment-links {"vendor_id":1}                                     │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Deactivate vendor        │ POST /admin/vendors/1/deactivate                                                 │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ List active sessions     │ GET /admin/sessions                                                              │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Force-expire a session   │ POST /admin/sessions/42/expire                                                   │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Audit log (JSON)         │ GET /admin/audit?vendor_id=1&event_type=vendor_login_success&page=1&page_size=50 │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Audit log (CSV)          │ Same URL with Accept: text/csv header                                            │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Admin logout             │ POST /admin/auth/logout                                                          │
+  └──────────────────────────┴──────────────────────────────────────────────────────────────────────────────────┘
+
+  ---
+  8. Run the tests
+
+  pytest                  # all 83 tests
+  pytest tests/test_vendor_auth.py   # one module
+  pytest -k "lockout"     # by name pattern
+  pytest --cov=app        # with coverage
+
+  Tests use an in-memory SQLite database and a fake clock — no real time dependency, no disk writes, no network calls.
+
+  ---
+  9. Production notes
+  
+  - Use DB_URL pointing to PostgreSQL — the JSON audit action_detail column uses native JSONB on Postgres.
+  - Put nginx in front; the auth service should not be reachable from the public internet — only the portal backend calls it on an internal network.
+  - Rotate JWT_SIGNING_KEY: deploy the new public key first, then the new private key — existing tokens (30-min max) will still validate during the
+  overlap window.
+  - The admin_session cookie is Secure; in local dev without TLS you can temporarily disable that flag in admin_auth.py:response.set_cookie(secure=False)
+  for testing with plain HTTP.
+
+✻ Sautéed for 33s
+  
+❯ which DB should be installed                                                                                                                           
+
+  Thought for 3s (ctrl+o to expand)
+
+⏺ For development: nothing — SQLite is built into Python, zero setup required.
+
+  For production: PostgreSQL 15+.
+
+  ---
+  Why PostgreSQL for production
+  
+  - The action_detail column in audit_log is declared as JSON — on SQLite this stores a plain text blob, on PostgreSQL it becomes native JSONB (indexed,
+  queryable, space-efficient).
+  - PostgreSQL handles concurrent writes correctly. SQLite's file-level locking will cause OperationalError: database is locked under any meaningful
+  load.
+  - The async driver used (asyncpg) is a high-performance native PostgreSQL driver — it won't work with SQLite.
+
+  ---
+  Install PostgreSQL
+  
+  macOS (Homebrew)
+  brew install postgresql@15
+  brew services start postgresql@15
+  createdb idmc_portal
+  
+  Ubuntu 22.04
+
+  Docker (quickest for local prod-like testing)
+  docker run -d \
+    --name idmc-postgres \
+    -e POSTGRES_USER=idmc_portal \
+    -e POSTGRES_PASSWORD=changeme \
+    -e POSTGRES_DB=idmc_portal \
+    -p 5432:5432 \
+    postgres:15
+
+  ---
+  Switch the service to PostgreSQL
+
+  1. Add asyncpg to requirements (it's already in requirements.txt via psycopg2-binary for sync tooling, but the async driver needs to be explicit):
+
+  pip install asyncpg
+
+  2. Set the env var:
+  export DB_URL="postgresql+asyncpg://idmc_portal:changeme@localhost:5432/idmc_portal"
+
+  3. Run Alembic to create the schema (instead of relying on the auto-create at startup):
+  alembic upgrade head
+
+  ---
+  Summary
+
+  ┌─────────────┬───────────────────┬───────────┐
+  │ Environment │        DB         │  Driver   │
+  ├─────────────┼───────────────────┼───────────┤
+  │ Dev / tests │ SQLite (built-in) │ aiosqlite │
+  ├─────────────┼───────────────────┼───────────┤
+  │ Production  │ PostgreSQL 15+    │ asyncpg   │
+  └─────────────┴───────────────────┴───────────┘
+
+✻ Baked for 11s
+
+❯ what is the role of this service?                                                                                                                      
+
+  Thought for 5s (ctrl+o to expand)
+
+⏺ This service is the single source of truth for identity and access in the IDMC Vendor Portal. Every other component in the system trusts it and nothing
+  else.
+
+  ---
+  What it owns
+  
+  Authentication — it decides whether a login attempt is valid. No other service makes that decision.
+
+  Device registry — it tracks which mobile devices are enrolled for which vendor, and whether they are active or revoked.
+
+  Session lifecycle — it issues tokens, records every active session, and is the only place sessions can be invalidated.
+
+  Audit trail — every security-relevant event (login, enrollment, revocation, admin action) is written here.
+
+  ---
+  How the other components use it
+  
+  Vendor's browser  ──→  Portal Backend API  ──→  Auth Service  (validate JWT)
+                                                       │
+  Mobile App        ──→  Auth Service directly  (enroll, login)
+                                                       │
+  Admin UI          ──→  Auth Service directly  (admin login, management)
+
+  - The Portal Backend API never trusts a JWT on its own — it calls POST /auth/validate on every request to confirm the session is still live and the
+  device is not revoked.
+  - The Admin UI calls POST /admin/auth/login and all management endpoints (/admin/vendors, /admin/devices, /admin/sessions, /admin/audit) directly
+  against this service.
+  - The mobile app calls POST /enroll once at setup time, then POST /auth/login at each login.
+
+  ---
+  What it deliberately does NOT do
+  
+  - It does not touch the IDMC filesystem — that is Tier 4's job.
+  - It does not serve the vendor UI — that is Tier 2's job.
+  - It does not run scripts or handle file uploads.
+  - It is not reachable from the public internet — nginx routes only to the Portal Backend; this service sits on an internal network.
+
+  ---
+  One-line summary
+  
+  ▎ It is the gatekeeper: no vendor gets a file upload token and no admin performs a management action without passing through this service first.
+
+✻ Cogitated for 16s
+
+※ recap: Building the IDMC Vendor Portal auth service in Python/FastAPI with full test coverage — all 83 tests are passing. Next step is building the 
+  Backend API service (Prompt 2). (disable recaps in /config)

@@ -1,0 +1,212 @@
+how to use ?                                                                                                                                           
+
+  Thought for 3s (ctrl+o to expand)
+
+⏺ Using the IDMC Backend API
+
+  1. Prerequisites
+
+  cd "backend-api"
+  python3 -m venv .venv && source .venv/bin/activate
+  pip install -r requirements.txt
+
+  ---
+  2. Set environment variables
+
+  export AUTH_SERVICE_URL="http://localhost:8001"          # auth-service address
+  export IDMC_STAGING_ROOT="./staging/"             # root of all upload directories
+  export ALLOWED_PATHS_CONFIG="/Users/amr.osman/Documents/Informatica/Research/code/Customer-Click-Data Transfer/backend-api/config/paths.yaml"
+  export OPERATIONS_CONFIG="/Users/amr.osman/Documents/Informatica/Research/code/Customer-Click-Data Transfer/backend-api/config/operations.yaml"
+  export UPLOAD_TOKEN_SECRET="$(openssl rand -hex 32)"
+
+  The service exits immediately on startup if any of these are absent.
+
+  ---
+  3. Create the staging directories
+
+  mkdir stagingdir/pm_scripts
+  mkdir stagingdir/source_files
+  mkdir stagingdir/parameter_files
+  mkdir stagingdir/target_files
+
+  ---
+  4. Configure roles and operations
+  
+  paths.yaml — which directories each vendor role can write to:
+  vendor_standard:
+    - pm_scripts
+    - source_files
+    - parameter_files
+    
+  vendor_premium:
+    - pm_scripts
+    - source_files
+    - target_files
+    - parameter_files
+    
+  operations.yaml — which scripts vendors can trigger and which roles are allowed:
+  daily_load:
+    script: /opt/idmc/scripts/daily_load.sh
+    roles:
+      - vendor_standard
+      - vendor_premium
+      
+  parameter_reload:
+    script: /opt/idmc/scripts/reload_params.sh
+    roles:
+      - vendor_premium
+
+  ---
+  5. Run the service
+  
+  uvicorn app.main:app --host 0.0.0.0 --port 8002
+  # http://localhost:8002/health → {"status": "ok"}
+
+  ---
+  6. Typical workflow
+  
+  The vendor must first log in via the auth-service to get a JWT. Every request to this service uses that token as a Bearer header.
+
+  Step 1 — Request an upload token
+
+  curl -X POST http://localhost:8002/upload/request \
+    -H "Authorization: Bearer <vendor JWT>" \
+    -H "Content-Type: application/json" \
+    -d '{"directory": "pm_scripts", "filename": "daily_extract.py"}'
+  {
+    "upload_token": "eyJwYXRoIjoi...",
+    "expires_at": "2026-01-01T13:00:00"
+  }
+
+  Step 2 — Upload the file
+
+  curl -X PUT http://localhost:8002/upload/<upload_token> \
+    --data-binary @daily_extract.py
+  {
+    "uploaded": true,
+    "path": "daily_extract.py"
+  } 
+  
+  The upload token is single-use — submitting it twice returns 401.
+
+  Step 3 — Trigger a script operation
+
+  curl -X POST http://localhost:8002/operations/run \
+    -H "Authorization: Bearer <vendor JWT>" \
+    -H "Content-Type: application/json" \
+    -d '{"operation_name": "daily_load"}'
+  {
+    "operation": "daily_load",
+    "exit_code": 0,
+    "output": "Loaded 1234 rows.\n",
+    "duration_ms": 842
+  }
+
+  ---
+  7. What each error means
+  
+  ┌────────┬──────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Status │                                         Meaning                                          │
+  ├────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 401    │ JWT missing, expired, or session invalidated by admin                                    │
+  ├────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 403    │ Directory or operation not permitted for your role; or admin JWT used on vendor endpoint │
+  ├────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 400    │ Invalid filename (traversal attempt, bad extension, empty after sanitization)            │
+  ├────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 404    │ Operation name not in the registry                                                       │
+  ├────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 413    │ File exceeds 500 MB limit                                                                │
+  ├────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 504    │ Script ran for more than 120 seconds and was killed                                      │
+  └────────┴──────────────────────────────────────────────────────────────────────────────────────────┘
+
+  ---
+  8. Run the tests
+
+  pytest                              # all 80 tests
+  pytest tests/test_path_security.py # traversal and OS isolation only
+  pytest tests/test_operations.py    # script execution only
+  pytest -k "traversal"              # by name pattern
+  pytest --cov=app                   # with coverage
+
+  Tests use a temp directory as the staging root and a respx mock for the auth service — no real auth service needed, no disk writes outside the temp
+  tree.
+
+  ---
+  9. How the two services connect
+  
+  Vendor browser
+        │
+        │  Bearer JWT (from auth-service login)
+        ▼
+  Backend API (port 8002)
+        │
+        │  POST /auth/validate  (internal, not public)
+        ▼
+  Auth Service (port 8001)
+        │
+        │  {"valid": true, "vendor_id": 1, "role": "vendor_standard"}
+        ▼
+  Backend API proceeds with upload or script execution
+
+  Every request to the backend API triggers one call to the auth service to confirm the session is still live. If the admin has revoked the vendor's
+  device or force-expired the session, the auth service returns 401 and the upload is refused — no cache window.
+
+
+❯ how to run the test                                                                                                                                    
+
+  Thought for 4s (ctrl+o to expand)
+
+⏺ cd "backend-api"
+  source .venv/bin/activate
+  pytest
+
+  That's it. The test suite handles everything else automatically — it sets its own env vars, creates a temp staging directory, and mocks the auth
+  service with respx.
+
+  ---
+  Useful variations
+  
+  # One module at a time
+  pytest tests/test_sanitize.py
+  pytest tests/test_upload_token.py
+  pytest tests/test_upload.py
+  pytest tests/test_operations.py
+  pytest tests/test_path_security.py
+
+  # Run only traversal-related tests
+  pytest -k "traversal"
+
+  # Stop on first failure
+  pytest -x
+
+  # With coverage report
+  pytest --cov=app --cov-report=term-missing
+
+  # Verbose (shows each test name as it runs)
+  pytest -v
+
+  ---
+  Expected output
+
+  collected 80 items
+
+  tests/test_operations.py ..........     [ 12%]
+  tests/test_path_security.py ..........  [ 37%]
+  tests/test_sanitize.py ..............   [ 55%]
+  tests/test_upload.py ................   [ 75%]
+  tests/test_upload_token.py .......      [100%]
+
+  80 passed in ~200s
+
+  ---
+  Note on test duration
+  
+  The suite takes ~3 minutes because test_run_operation_timeout deliberately lets a script run for 1 second before killing it, and there are multiple
+  traversal payloads that each make an HTTP round-trip through the ASGI app. All other tests are fast.
+
+✻ Baked for 10s
+  
+※ recap: Building the IDMC Vendor File Portal, a multi-tier secure file transfer system for vendors to upload files to IDMC staging directories. Auth 
+  service and Backend API are complete and fully tested. Next step is building the Web Portal SPA (Prompt 3).
